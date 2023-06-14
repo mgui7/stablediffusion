@@ -414,13 +414,47 @@ class DDPM(pl.LightningModule):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         return self.p_losses(x, t, *args, **kwargs)
 
+    def get_multi_input(self, batch, k):
+        if isinstance(k, str):
+            return DDPM.get_input(self, batch, k)
+        try:
+            res = {}
+            for key in k:
+                res[key] = DDPM.get_input(self, batch, key)
+            return res
+        except:
+            raise NotImplementedError
+
     def get_input(self, batch, k):
         x = batch[k]
+        if isinstance(x, dict):
+            for key in x:
+                val = x[key]
+                if len(val.shape) == 3:
+                    val = val[..., None]
+                if val.shape[-1] < 10:
+                    val = rearrange(val, 'b h w c -> b c h w')
+                x[key] = val.to(memory_format=torch.contiguous_format).float().detach()
+            return x
+
+        if isinstance(x, list):
+            if isinstance(x[0], str):
+                return x # No operation needed here
+            for i,val in enumerate(x):
+                if len(val.shape) == 3:
+                    val = val[..., None]
+                val = rearrange(val, 'b h w c -> b c h w')
+                x[i] = val.to(memory_format=torch.contiguous_format).float()
+
         if len(x.shape) == 3:
             x = x[..., None]
+        elif len(x.shape) == 5: # first_stage_key == 'video'
+            self.video_batch_number = x.shape[0]
+            x = rearrange(x, 'b l h w c -> (b l) h w c')
         x = rearrange(x, 'b h w c -> b c h w')
         x = x.to(memory_format=torch.contiguous_format).float()
         return x
+
 
     def shared_step(self, batch):
         x = self.get_input(batch, self.first_stage_key)
@@ -592,7 +626,7 @@ class LatentDiffusion(DDPM):
             assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
             # set rescale weight to 1./std of encodings
             print("### USING STD-RESCALING ###")
-            x = super().get_input(batch, self.first_stage_key)
+            x = super().get_multi_input(batch, self.first_stage_key)
             x = x.to(self.device)
             encoder_posterior = self.encode_first_stage(x)
             z = self.get_first_stage_encoding(encoder_posterior).detach()
@@ -764,7 +798,7 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None, return_x=False):
-        x = super().get_input(batch, k)
+        x = super().get_multi_input(batch, k) if not isinstance(k, str) else super().get_input(batch, k)
         if bs is not None:
             x = x[:bs]
         x = x.to(self.device)
@@ -780,7 +814,9 @@ class LatentDiffusion(DDPM):
                 elif cond_key in ['class_label', 'cls']:
                     xc = batch
                 else:
-                    xc = super().get_input(batch, cond_key).to(self.device)
+                    xc = super().get_multi_input(batch, cond_key) if not isinstance(cond_key, str) else super().get_input(batch, cond_key)
+                    if isinstance(xc, torch.Tensor):
+                        xc = xc.to(self.device)
             else:
                 xc = x
             if not self.cond_stage_trainable or force_c_encode:
@@ -1804,7 +1840,7 @@ class LatentUpscaleFinetuneDiffusion(LatentFinetuneDiffusion):
 class ImageEmbeddingConditionedLatentDiffusion(LatentDiffusion):
     def __init__(self, embedder_config, embedding_key="jpg", embedding_dropout=0.5,
                  freeze_embedder=True, noise_aug_config=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        LatentDiffusion.__init__(self, *args, **kwargs)
         self.embed_key = embedding_key
         self.embedding_dropout = embedding_dropout
         self._init_embedder(embedder_config, freeze_embedder)

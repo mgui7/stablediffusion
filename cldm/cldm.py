@@ -14,17 +14,22 @@ from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from ldm.modules.attention import SpatialTransformer
 from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock, Upsample
-from ldm.models.diffusion.ddpm import LatentDiffusion
+from ldm.models.diffusion.ddpm import LatentDiffusion, ImageEmbeddingConditionedLatentDiffusion
 from ldm.util import log_txt_as_img, exists, instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 
 
 class ControlledUnetModel(UNetModel):
-    def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
+    def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, 
+                y=None, **kwargs):
         hs = []
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
             emb = self.time_embed(t_emb)
+            if self.num_classes is not None:
+                assert y.shape[0] == x.shape[0]
+                emb = emb + self.label_emb(y)
+
             h = x.type(self.dtype)
             for module in self.input_blocks:
                 h = module(h, emb, context)
@@ -303,6 +308,44 @@ class ControlNet(nn.Module):
 
         return outs
 
+class ControlNetUnclip(ControlNet):
+    def __init__(self, image_size, in_channels, model_channels, hint_channels, num_res_blocks, attention_resolutions, dropout=0, channel_mult=(1, 2, 4, 8), conv_resample=True, dims=2, use_checkpoint=False, use_fp16=False, num_heads=-1, num_head_channels=-1, num_heads_upsample=-1, use_scale_shift_norm=False, resblock_updown=False, use_new_attention_order=False, use_spatial_transformer=False, transformer_depth=1, context_dim=None, n_embed=None, legacy=True, disable_self_attentions=None, num_attention_blocks=None, disable_middle_self_attn=False, use_linear_in_transformer=False,
+                 adm_in_channels=None):
+        super().__init__(image_size, in_channels, model_channels, hint_channels, num_res_blocks, attention_resolutions, dropout, channel_mult, conv_resample, dims, use_checkpoint, use_fp16, num_heads, num_head_channels, num_heads_upsample, use_scale_shift_norm, resblock_updown, use_new_attention_order, use_spatial_transformer, transformer_depth, context_dim, n_embed, legacy, disable_self_attentions, num_attention_blocks, disable_middle_self_attn, use_linear_in_transformer)
+        assert adm_in_channels is not None
+
+        time_embed_dim = model_channels * 4
+        self.label_emb = nn.Sequential(
+            nn.Sequential(
+                linear(adm_in_channels, time_embed_dim),
+                nn.SiLU(),
+                linear(time_embed_dim, time_embed_dim),
+            )
+        )
+
+    def forward(self, x, hint, timesteps, context, y, **kwargs):
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
+        # Important!
+        emb = emb + self.label_emb(y)
+        guided_hint = self.input_hint_block(hint, emb, context)
+
+        outs = []
+
+        h = x.type(self.dtype)
+        for module, zero_conv in zip(self.input_blocks, self.zero_convs):
+            if guided_hint is not None:
+                h = module(h, emb, context)
+                h += guided_hint
+                guided_hint = None
+            else:
+                h = module(h, emb, context)
+            outs.append(zero_conv(h, emb, context))
+
+        h = self.middle_block(h, emb, context)
+        outs.append(self.middle_block_out(h, emb, context))
+
+        return outs
 
 class ControlLDM(LatentDiffusion):
 
@@ -559,40 +602,79 @@ class ControlLDMPlus(ControlLDM):
     
 
 from contextlib import nullcontext
-class ControlUnclipLDM(LatentDiffusion):
-    def __init__(self, embedder_config, embedding_key="jpg", embedding_dropout=0.5,
-                 freeze_embedder=True, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.embed_key = embedding_key
-        self.embedding_dropout = embedding_dropout
-        self._init_embedder(embedder_config)
+class ControlUnclipLDM(ImageEmbeddingConditionedLatentDiffusion, ControlLDM):
+    def __init__(self, embedder_config, embedding_key,  
+                 control_stage_config, control_key, 
+                 hint_stage_config,
+                 only_mid_control=True, sd_locked=True,
+                 embedding_dropout=0., freeze_embedder=True, noise_aug_config=None,
+                 *args, **kwargs):
+        super().__init__(embedder_config, embedding_key, embedding_dropout, freeze_embedder, noise_aug_config, *args, **kwargs)
+        
+        # ControlNet config
+        self.control_model = instantiate_from_config(control_stage_config)
+        self.control_key = control_key
+        self.only_mid_control = only_mid_control
+        self.sd_locked = sd_locked
+        self.control_scales = [1.0] * 13
 
-    def _init_embedder(self, config):
-        self.embedder = instantiate_from_config(config)
-        # if freeze:
-        #     self.embedder = embedder.eval()
-        #     self.embedder.train = disabled_train
-        #     for param in self.embedder.parameters():
-        #         param.requires_grad = False
+        # ControlLDMPlus config        
+        self.hint_stage_model = instantiate_from_config(hint_stage_config)
+
+    # def _init_embedder(self, config, freeze):
+    #     self.embedder = instantiate_from_config(config)
+    #     if freeze:
+    #         self.embedder = embedder.eval()
+    #         self.embedder.train = disabled_train
+    #         for param in self.embedder.parameters():
+    #             param.requires_grad = False
 
     def get_input(self, batch, k, cond_key=None, bs=None, **kwargs):
-        outputs = LatentDiffusion.get_input(self, batch, k, bs=bs, **kwargs)
+        # Control signal
+        control = super().get_multi_input(batch, self.control_key)
+        control = self.hint_stage_model.encode(control)
+        if bs is not None:
+            control = control[:bs]
+        control = control.to(memory_format=torch.contiguous_format).float()
+
+        outputs = LatentDiffusion.get_input(self, batch, k, bs=bs, **kwargs)        
         z, c = outputs[0], outputs[1]
-        c = self.cond_stage_model.encode(c)
         img = batch[self.embed_key][:bs]
         img = rearrange(img, 'b h w c -> b c h w')
-        c_adm = self.embedder(img).squeeze(1)
-        # if self.noise_augmentor is not None:
-        #     c_adm, noise_level_emb = self.noise_augmentor(c_adm)
-        #     # assume this gives embeddings of noise levels
-        #     c_adm = torch.cat((c_adm, noise_level_emb), 1)
+        c_adm = self.embedder(img)
+        if self.noise_augmentor is not None:
+            c_adm, noise_level_emb = self.noise_augmentor(c_adm)
+            # assume this gives embeddings of noise levels
+            c_adm = torch.cat((c_adm, noise_level_emb), 1)
         if self.training:
             c_adm = torch.bernoulli((1. - self.embedding_dropout) * torch.ones(c_adm.shape[0],
                                                                                device=c_adm.device)[:, None]) * c_adm
-        all_conds = {"c_crossattn": [c], "c_adm": c_adm}
+        all_conds = {"c_crossattn": [c], "c_adm": c_adm,
+                     "c_concat": [control]}
         noutputs = [z, all_conds]
         noutputs.extend(outputs[2:])
         return noutputs
+    
+    def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+        assert isinstance(cond, dict)
+        diffusion_model = self.model.diffusion_model
+
+        cond_txt = torch.cat(cond['c_crossattn'], 1)
+        clip_img = cond['c_adm']
+
+        if cond['c_concat'] is None:
+            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, 
+                                  y=clip_img,
+                                  control=None, only_mid_control=self.only_mid_control)
+        else:
+            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt,
+                                         y=clip_img)
+            control = [c * scale for c, scale in zip(control, self.control_scales)]
+            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, 
+                                  y=clip_img,
+                                  control=control, only_mid_control=self.only_mid_control)
+
+        return eps
 
     def get_unconditional_conditioning(self, N, label=''):
         if hasattr(self.cond_stage_model, 'get_unconditional_conditioning'):
@@ -607,13 +689,16 @@ class ControlUnclipLDM(LatentDiffusion):
         log["inputs"] = x
         log["reconstruction"] = xrec
         assert self.model.conditioning_key is not None
-        assert self.cond_stage_key in ["caption", "txt"]
-        xc = log_txt_as_img((x.shape[2], x.shape[3]), batch[self.cond_stage_key], size=x.shape[2] // 25)
-        log["conditioning"] = xc
+        # assert self.cond_stage_key in ["caption", "txt"]
+        # xc = log_txt_as_img((x.shape[2], x.shape[3]), batch[self.cond_stage_key], size=x.shape[2] // 25)
+        # EDIT HERE FOR DIFFERENT CONDITIONING
+        # log["conditioning"] = xc
+        log['first_frame'] = c['c_concat'][0][:,:3]
+        log['last_frame'] = c['c_concat'][0][:,3:]
         uc = self.get_unconditional_conditioning(N, kwargs.get('unconditional_guidance_label', ''))
         unconditional_guidance_scale = kwargs.get('unconditional_guidance_scale', 5.)
 
-        uc_ = {"c_crossattn": [uc], "c_adm": c["c_adm"]}
+        uc_ = {"c_crossattn": [uc], "c_adm": c["c_adm"], "c_concat": c["c_concat"]}
         ema_scope = self.ema_scope if kwargs.get('use_ema_scope', True) else nullcontext
         with ema_scope(f"Sampling"):
             samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=True,
@@ -624,11 +709,30 @@ class ControlUnclipLDM(LatentDiffusion):
             log[f"samplescfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
         return log
 
-    def forward(self, x, c, *args, **kwargs):
-        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
-        if self.model.conditioning_key is not None:
-            assert c is not None
-            if self.shorten_cond_schedule:  # TODO: drop this option
-                tc = self.cond_ids[t].to(self.device)
-                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        return self.p_losses(x, c, t, *args, **kwargs)
+    def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+        assert isinstance(cond, dict)
+        diffusion_model = self.model.diffusion_model
+
+        cond_txt = torch.cat(cond['c_crossattn'], 1)
+        c_adm = cond['c_adm']
+
+        if cond['c_concat'] is None:
+            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control,
+                                  y=c_adm)
+        else:
+            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt,
+                                         y=c_adm)
+            control = [c * scale for c, scale in zip(control, self.control_scales)]
+            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control,
+                                  y=c_adm)
+
+        return eps
+    
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        params = list(self.control_model.parameters())
+        if not self.sd_locked:
+            params += list(self.model.diffusion_model.output_blocks.parameters())
+            params += list(self.model.diffusion_model.out.parameters())
+        opt = torch.optim.AdamW(params, lr=lr)
+        return opt

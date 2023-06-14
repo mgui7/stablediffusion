@@ -26,7 +26,7 @@ def load_model_from_config(config, ckpt, verbose=False):
     pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
+    sd = pl_sd["state_dict"] if 'state_dict' in pl_sd else pl_sd
     model = instantiate_from_config(config.model)
     m, u = model.load_state_dict(sd, strict=False)
     if len(m) > 0 and verbose:
@@ -406,14 +406,16 @@ class ImageLogger(Callback):
 
             with torch.no_grad():
                 images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
-
             for k in images:
-                N = min(images[k].shape[0], self.max_images)
-                images[k] = images[k][:N]
-                if isinstance(images[k], torch.Tensor):
-                    images[k] = images[k].detach().cpu()
-                    if self.clamp:
-                        images[k] = torch.clamp(images[k], -1., 1.)
+                try:
+                    N = min(images[k].shape[0], self.max_images)
+                    images[k] = images[k][:N]
+                    if isinstance(images[k], torch.Tensor):
+                        images[k] = images[k].detach().cpu()
+                        if self.clamp:
+                            images[k] = torch.clamp(images[k], -1., 1.)
+                except:
+                    pass
 
             self.log_local(pl_module.logger.save_dir, split, images,
                            pl_module.global_step, pl_module.current_epoch, batch_idx)

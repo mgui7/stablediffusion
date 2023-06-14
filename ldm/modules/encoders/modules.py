@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import kornia
 from torch.utils.checkpoint import checkpoint
+from einops import rearrange
 
 from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel
 
@@ -348,3 +349,49 @@ class CLIPEmbeddingNoiseAugmentation(ImageConcatWithNoiseAugmentation):
         z = self.unscale(z)
         noise_level = self.time_embed(noise_level)
         return z, noise_level
+
+
+class FixedPositionalEmbedding2D(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        inv_freq = 1. / (10000 ** (torch.arange(0, dim, 4).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, x, offset=0):
+        """_summary_
+
+        Args:
+            x (torch.Tensor): in shape of [b, 2, h, w]
+            offset (int, optional): sinusodal offset. Defaults to 0.
+        """
+        B,C,H,W = x.shape
+
+        x = rearrange(x, 'b c h w -> b (c h w)').unsqueeze(-1) + offset
+        x = x * self.inv_freq
+        x = torch.concat((x.sin(), x.cos()), dim=-1)
+        emb = rearrange(x, 'b (c h w) dim -> b (c dim) h w', b=B, c=C, h=H, w=W)
+        return emb
+
+class SimpleFlowConcatenator(AbstractEncoder):
+    def __init__(self, size=256, device='cuda', use_fourier_embed=True):
+        super().__init__()
+        self.size = size
+        self.device_ = device
+        self.use_fourier_embed = use_fourier_embed
+        if use_fourier_embed:
+            self.init_fourier_embed()
+
+    def init_fourier_embed(self):
+        xx,yy = torch.meshgrid(torch.arange(self.size,device=self.device_), 
+                               torch.arange(self.size,device=self.device_), 
+                               indexing="xy")
+        grid = torch.cat([xx.unsqueeze(0), yy.unsqueeze(0)], dim=0).unsqueeze(0).to(self.device)
+        fourier = FixedPositionalEmbedding2D(32)
+        self.register_buffer('coord_conv', fourier(grid))
+
+    def encode(self, cond):
+        x = cond['first_image']
+        flow = cond['flow']
+        b = flow.shape[0]
+        x = torch.concat((x,flow),dim=1)
+        return x
